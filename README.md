@@ -29,9 +29,11 @@ Für eine GitLab-Instanz mit URL-Unterpfad kann `GITLAB_URL` zum Beispiel `https
 
 ## Tools
 
-Die Tools folgen der Liste aus [`tools.md`](./tools.md): Projekte, Repository-Baum/Dateien/Suche/Commits, Branches/Tags/Releases, Merge Requests und Diskussionen, Issues, Pipelines und CI-Jobs. Listen liefern eine Seite mit `items`, `total_count`, `has_more` und `next_page`. Pro Aufruf sind bis zu 100 Einträge möglich.
+Die Tools folgen der Liste aus [`tools.md`](./tools.md): Projekte und Repository, Merge Requests und Issues sowie Pipelines und CI-Jobs. Für CI-Analysen kann Gemini Pipeline-Testreports mit fehlgeschlagenen Tests abrufen, Job-Logs und Jobdetails zusammenführen sowie einzelne Artefaktdateien laden. Das Durchsuchen von Artefaktarchiven benötigt GitLab 18.8 oder neuer; Abrufe von Report-Artefakten über `file_type` benötigen GitLab 19.4 oder neuer. Einzelne Artefaktdateien und Reports sind auf 90.000 Bytes begrenzt.
 
-Schreibende Operationen sind als MCP-Tools mit Schreibhinweisen markiert. Dazu gehören Branches, Commits, Merge Requests, Kommentare, Issues und das Starten von Pipelines.
+Listen liefern eine Seite mit `items`, `total_count`, `has_more` und `next_page`. Pro Aufruf sind bis zu 100 Einträge möglich.
+
+Schreibende Operationen sind als MCP-Tools mit Schreibhinweisen markiert. Dazu gehören Branches, Commits, Merge Requests, Kommentare, Issues sowie das Starten, Abbrechen und Wiederholen von Pipelines und Jobs. `play_job` löst genau den angegebenen manuellen Job aus.
 
 ## Gemini CLI
 

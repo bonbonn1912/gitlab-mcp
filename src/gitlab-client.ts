@@ -6,6 +6,10 @@ export interface GitLabResponse<T> {
   headers: Headers;
 }
 
+export interface GitLabDownload extends GitLabResponse<Uint8Array> {
+  truncated: boolean;
+}
+
 export class GitLabApiError extends Error {
   constructor(
     public readonly status: number,
@@ -106,6 +110,98 @@ export class GitLabClient {
       }
     }
     return { data: responseText as T, headers: response.headers };
+  }
+
+  async requestBytes(
+    path: string,
+    query: QueryParams = {},
+    maxBytes = 90_000,
+  ): Promise<GitLabDownload> {
+    const url = new URL(`${this.basePath}/api/v4/${path.replace(/^\/+/, "")}`, this.origin);
+    for (const [key, value] of Object.entries(query)) {
+      if (value === undefined) continue;
+      if (Array.isArray(value)) {
+        for (const item of value) url.searchParams.append(`${key}[]`, String(item));
+      } else {
+        url.searchParams.set(key, String(value));
+      }
+    }
+
+    let target = url;
+    let response: Response;
+    for (let redirects = 0; ; redirects += 1) {
+      try {
+        response = await fetch(target, {
+          method: "GET",
+          redirect: "manual",
+          headers: {
+            Accept: "*/*",
+            ...(target.origin === this.origin ? { "PRIVATE-TOKEN": this.token } : {}),
+            "User-Agent": "gitlab-datacenter-mcp-server/1.0.0",
+          },
+          signal: AbortSignal.timeout(30_000),
+        });
+      } catch (error) {
+        if (error instanceof DOMException && error.name === "TimeoutError") {
+          throw new Error("GitLab artifact download timed out after 30 seconds.");
+        }
+        throw new Error(`Could not download the GitLab artifact: ${safeErrorMessage(error)}`);
+      }
+
+      const location = response.headers.get("location");
+      if (![301, 302, 303, 307, 308].includes(response.status) || !location) break;
+      if (redirects >= 5) throw new Error("GitLab artifact download exceeded the redirect limit.");
+      await response.body?.cancel();
+      target = new URL(location, target);
+    }
+
+    if (!response.ok) {
+      const responseText = await response.text();
+      throw new GitLabApiError(
+        response.status,
+        describeApiError(response.status, responseText),
+        response.headers.get("x-request-id") ?? undefined,
+      );
+    }
+
+    const reader = response.body?.getReader();
+    if (!reader) return { data: new Uint8Array(), headers: response.headers, truncated: false };
+
+    const chunks: Uint8Array[] = [];
+    let totalBytes = 0;
+    let truncated = false;
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        const remaining = maxBytes - totalBytes;
+        if (value.byteLength > remaining) {
+          if (remaining > 0) chunks.push(value.subarray(0, remaining));
+          totalBytes += Math.max(remaining, 0);
+          truncated = true;
+          await reader.cancel();
+          break;
+        }
+        chunks.push(value);
+        totalBytes += value.byteLength;
+        if (totalBytes === maxBytes) {
+          const next = await reader.read();
+          truncated = !next.done && next.value.byteLength > 0;
+          if (!next.done) await reader.cancel();
+          break;
+        }
+      }
+    } finally {
+      reader.releaseLock();
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let offset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, offset);
+      offset += chunk.byteLength;
+    }
+    return { data: bytes, headers: response.headers, truncated };
   }
 }
 

@@ -1,6 +1,7 @@
 import { McpServer, type CallToolResult, type StandardSchemaWithJSON } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
 import dotenv from "dotenv";
+import { gunzipSync } from "node:zlib";
 import * as z from "zod/v4";
 import {
   encodePathSegment,
@@ -18,6 +19,8 @@ process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const MAX_TOOL_TEXT_CHARS = 150_000;
 const MAX_FILE_CHARS = 100_000;
+const MAX_ARTIFACT_BYTES = 90_000;
+const MAX_GZIP_EXPANDED_BYTES = 2_000_000;
 
 const projectId = z.union([z.string().min(1), z.number().int().positive()])
   .describe("GitLab project ID or URL-encoded path such as group/subgroup/project.");
@@ -40,7 +43,9 @@ function createServer(): McpServer {
       instructions:
         "Use this server only for the configured GitLab Self-Managed/Data Center instance. " +
         "Project IDs can be numeric IDs or full namespace paths. List tools return one page at a time; " +
-        "follow next_page when more results are needed. Write tools change GitLab state and should be used only when requested.",
+        "follow next_page when more results are needed. For CI investigations, combine pipeline jobs, job details/logs, " +
+        "test reports, and artifact files. Artifact browsing needs GitLab 18.8+ and report-by-type downloads need GitLab 19.4+. " +
+        "Write tools change GitLab state and should be used only when requested.",
     },
   );
 
@@ -117,6 +122,74 @@ function formatToolError(error: unknown): string {
 
 function projectPath(project: string | number, suffix = ""): string {
   return `projects/${encodePathSegment(project)}${suffix}`;
+}
+
+function encodeArtifactPath(path: string): string {
+  const segments = path.split("/");
+  if (segments.some((segment) => segment.length === 0 || segment === "." || segment === "..")) {
+    throw new Error("artifact_path must be a relative file path inside the artifact archive.");
+  }
+  return segments.map(encodeURIComponent).join("/");
+}
+
+async function getArtifactContent(
+  api: GitLabClient,
+  endpoint: string,
+  query: QueryParams = {},
+): Promise<Record<string, unknown>> {
+  const download = await api.requestBytes(endpoint, query, MAX_ARTIFACT_BYTES);
+  let bytes = download.data;
+  let truncated = download.truncated;
+  let compressed = false;
+  if (bytes.length >= 2 && bytes[0] === 0x1f && bytes[1] === 0x8b) {
+    compressed = true;
+    if (download.truncated) {
+      return {
+        content_type: download.headers.get("content-type"),
+        content: Buffer.from(bytes).toString("base64"),
+        content_encoding: "gzip+base64",
+        truncated: true,
+        max_bytes: MAX_ARTIFACT_BYTES,
+      };
+    }
+    try {
+      bytes = new Uint8Array(gunzipSync(bytes, { maxOutputLength: MAX_GZIP_EXPANDED_BYTES }));
+    } catch {
+      throw new Error(`The gzip-compressed artifact is invalid or expands beyond the ${MAX_GZIP_EXPANDED_BYTES}-byte safety limit.`);
+    }
+    if (bytes.length > MAX_ARTIFACT_BYTES) {
+      bytes = bytes.subarray(0, MAX_ARTIFACT_BYTES);
+      truncated = true;
+    }
+  }
+
+  const contentType = download.headers.get("content-type");
+  const isTextContentType = /^(text\/|application\/(json|xml|javascript|x-yaml|yaml|toml|graphql))/i.test(contentType ?? "");
+  let content: string;
+  let contentEncoding: string;
+  try {
+    const decoded = new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+    const hasBinaryControl = /[\u0000-\u0008\u000b\u000c\u000e-\u001f]/.test(decoded);
+    if (hasBinaryControl && !isTextContentType) throw new Error("binary content");
+    content = decoded;
+    contentEncoding = compressed ? "gzip+utf-8" : "utf-8";
+  } catch {
+    if (isTextContentType) {
+      content = new TextDecoder("utf-8").decode(bytes);
+      contentEncoding = compressed ? "gzip+utf-8" : "utf-8";
+    } else {
+      content = Buffer.from(bytes).toString("base64");
+      contentEncoding = compressed ? "gzip+base64" : "base64";
+    }
+  }
+
+  return {
+    content_type: contentType,
+    content,
+    content_encoding: contentEncoding,
+    truncated,
+    max_bytes: MAX_ARTIFACT_BYTES,
+  };
 }
 
 interface PageArgs {
@@ -327,12 +400,24 @@ function registerTools(server: McpServer, api: GitLabClient): void {
     z.object({ ...projectArgs, pipeline_id: z.number().int().positive() }).strict(),
     ({ project_id, pipeline_id }) => api.request("GET", projectPath(project_id, `/pipelines/${pipeline_id}`)).then((r) => r.data));
 
+  register(server, "get_pipeline_test_report", "Get detailed test results for a pipeline, including failed test cases, errors, and stack traces.",
+    z.object({ ...projectArgs, pipeline_id: z.number().int().positive(), ...pagination }).strict(),
+    ({ project_id, pipeline_id, page, per_page }) => api.request("GET", projectPath(project_id, `/pipelines/${pipeline_id}/test_report`), { page, per_page }).then((r) => r.data));
+
+  register(server, "get_pipeline_test_report_summary", "Get per-suite test totals and pass/fail/error counts for a pipeline.",
+    z.object({ ...projectArgs, pipeline_id: z.number().int().positive(), ...pagination }).strict(),
+    ({ project_id, pipeline_id, page, per_page }) => api.request("GET", projectPath(project_id, `/pipelines/${pipeline_id}/test_report_summary`), { page, per_page }).then((r) => r.data));
+
   register(server, "run_pipeline", "Create a pipeline for a branch, tag, or commit ref. This starts CI jobs.",
     z.object({
       ...projectArgs, ref: z.string().min(1),
       variables: z.array(z.object({ key: z.string().min(1), value: z.string(), variable_type: z.enum(["env_var", "file"]).optional() }).strict()).max(100).optional(),
     }).strict(),
     ({ project_id, ref, ...body }) => api.request("POST", projectPath(project_id, "/pipeline"), { ref }, body).then((r) => r.data), false);
+
+  register(server, "cancel_pipeline", "Cancel all active jobs in a pipeline.",
+    z.object({ ...projectArgs, pipeline_id: z.number().int().positive() }).strict(),
+    ({ project_id, pipeline_id }) => api.request("POST", projectPath(project_id, `/pipelines/${pipeline_id}/cancel`)).then((r) => r.data), false);
 
   register(server, "list_pipeline_jobs", "List jobs for a pipeline, optionally filtered by job status.",
     z.object({
@@ -342,6 +427,22 @@ function registerTools(server: McpServer, api: GitLabClient): void {
     }).strict(),
     (a) => listPage(api, projectPath(a.project_id, `/pipelines/${a.pipeline_id}/jobs`), a, { scope: a.scope, include_retried: a.include_retried }));
 
+  register(server, "get_job_details", "Get metadata and status for a CI job, including stage, timing, runner, and artifact metadata.",
+    z.object({ ...projectArgs, job_id: z.number().int().positive() }).strict(),
+    ({ project_id, job_id }) => api.request("GET", projectPath(project_id, `/jobs/${job_id}`)).then((r) => r.data));
+
+  register(server, "play_job", "Start the specified manual CI job. This changes pipeline state; select the exact job ID to avoid triggering a different deployment job.",
+    z.object({ ...projectArgs, job_id: z.number().int().positive() }).strict(),
+    ({ project_id, job_id }) => api.request("POST", projectPath(project_id, `/jobs/${job_id}/play`)).then((r) => r.data), false);
+
+  register(server, "retry_job", "Retry a CI job. This starts the job again and may consume runner resources.",
+    z.object({ ...projectArgs, job_id: z.number().int().positive() }).strict(),
+    ({ project_id, job_id }) => api.request("POST", projectPath(project_id, `/jobs/${job_id}/retry`)).then((r) => r.data), false);
+
+  register(server, "cancel_job", "Cancel a running CI job. Set force only to force-cancel a job already in the canceling state.",
+    z.object({ ...projectArgs, job_id: z.number().int().positive(), force: z.boolean().optional() }).strict(),
+    ({ project_id, job_id, force }) => api.request("POST", projectPath(project_id, `/jobs/${job_id}/cancel`), { force }).then((r) => r.data), false);
+
   register(server, "get_job_log", "Get the trace/log output for a CI job. Output is limited to 100,000 characters.",
     z.object({ ...projectArgs, job_id: z.number().int().positive() }).strict(),
     async ({ project_id, job_id }) => {
@@ -349,6 +450,33 @@ function registerTools(server: McpServer, api: GitLabClient): void {
       const text = response.data;
       return { job_id, log: text.slice(0, MAX_FILE_CHARS), truncated: text.length > MAX_FILE_CHARS };
     });
+
+  register(server, "list_job_artifacts", "Browse files in a job artifact archive. Requires GitLab 18.8 or newer.",
+    z.object({
+      ...projectArgs, job_id: z.number().int().positive(), path: z.string().default(""),
+      recursive: z.boolean().default(false), ...pagination,
+    }).strict(),
+    ({ project_id, job_id, path, recursive, ...page }) =>
+      listPage(api, projectPath(project_id, `/jobs/${job_id}/artifacts/tree`), page, { path, recursive }));
+
+  register(server, "get_job_artifact_file", "Download one file from a job artifact archive. Text files are returned as UTF-8; binary files as Base64. Output is capped at 90,000 bytes.",
+    z.object({ ...projectArgs, job_id: z.number().int().positive(), artifact_path: z.string().min(1) }).strict(),
+    ({ project_id, job_id, artifact_path }) =>
+      getArtifactContent(api, projectPath(project_id, `/jobs/${job_id}/artifacts/${encodeArtifactPath(artifact_path)}`)));
+
+  register(server, "get_job_report_artifact", "Download a report artifact such as JUnit XML by type. Requires GitLab 19.4 or newer; output is capped at 90,000 bytes.",
+    z.object({
+      ...projectArgs,
+      job_id: z.number().int().positive(),
+      file_type: z.enum([
+        "accessibility", "api_fuzzing", "archive", "browser_performance", "cluster_image_scanning",
+        "cobertura", "codequality", "container_scanning", "cyclonedx", "dast", "dependency_scanning",
+        "dotenv", "jacoco", "junit", "license_scanning", "load_performance", "lsif", "metrics",
+        "performance", "requirements", "requirements_v2", "sarif", "sast", "secret_detection",
+      ]),
+    }).strict(),
+    ({ project_id, job_id, file_type }) =>
+      getArtifactContent(api, projectPath(project_id, `/jobs/${job_id}/artifacts`), { file_type }));
 
   register(server, "list_branches", "List repository branches, optionally matching a name search.",
     z.object({ ...projectArgs, search: z.string().optional(), ...pagination }).strict(),
