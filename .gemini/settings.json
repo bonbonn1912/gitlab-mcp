@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "gitlab-datacenter": {
+      "command": "node",
+      "args": ["dist/index.js"],
+      "env": {
+        "GITLAB_URL": "${GITLAB_URL}",
+        "GITLAB_TOKEN": "${GITLAB_TOKEN}"
+      },
+      "trust": false
+    }
+  }
+}
