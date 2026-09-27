@@ -15,11 +15,11 @@ npm install
 npm run build
 ```
 
-Setze die Zugangsdaten in der Shell, aus der du Gemini CLI startest. Den Token nicht in `.gemini/settings.json` oder im Quellcode speichern.
+Die Gemini-Konfiguration reicht `GITLAB_URL` und `GITLAB_TOKEN` aus der Umgebung explizit an den MCP-Server weiter. Wenn diese Variablen nicht gesetzt sind, lädt der Server sie aus `.env`. `.env` wird von Git ignoriert; den Token nicht direkt in `.gemini/settings.json` oder im Quellcode speichern.
 
 ```sh
-export GITLAB_URL="https://gitlab.firma.example"
-export GITLAB_TOKEN="<dein-token>"
+cp .env.example .env
+# .env bearbeiten und GITLAB_URL sowie GITLAB_TOKEN eintragen
 gemini
 ```
 
@@ -38,6 +38,8 @@ Schreibende Operationen sind als MCP-Tools mit Schreibhinweisen markiert. Dazu g
 Die enthaltene Projektkonfiguration definiert den Server `gitlab-datacenter`. Prüfe die Verbindung in Gemini CLI mit `/mcp list`; Tools erscheinen mit dem Präfix `mcp_gitlab-datacenter_`, zum Beispiel `mcp_gitlab-datacenter_list_projects`.
 
 Bei fehlenden oder ungültigen Zugangsdaten gibt der Server die Ursache über `stderr` aus. `stdout` bleibt für das MCP-Protokoll reserviert.
+
+Für die angefragte interne Self-Signed-Konfiguration setzt der Prozess `NODE_TLS_REJECT_UNAUTHORIZED=0`. Dadurch wird die TLS-Zertifikatsprüfung für sämtliche HTTPS-Verbindungen dieses MCP-Prozesses abgeschaltet.
 
 ## Sicherheit und Grenzen
 

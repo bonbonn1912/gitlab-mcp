@@ -1,5 +1,6 @@
 import { McpServer, type CallToolResult, type StandardSchemaWithJSON } from "@modelcontextprotocol/server";
 import { serveStdio } from "@modelcontextprotocol/server/stdio";
+import dotenv from "dotenv";
 import * as z from "zod/v4";
 import {
   encodePathSegment,
@@ -7,6 +8,13 @@ import {
   GitLabClient,
   type QueryParams,
 } from "./gitlab-client.js";
+
+for (const key of ["GITLAB_URL", "GITLAB_TOKEN"] as const) {
+  if (process.env[key] === "") delete process.env[key];
+}
+dotenv.config({ path: new URL("../.env", import.meta.url), quiet: true });
+// Requested compatibility for internal self-signed certificates. This disables TLS certificate validation for this process.
+process.env.NODE_TLS_REJECT_UNAUTHORIZED = "0";
 
 const MAX_TOOL_TEXT_CHARS = 150_000;
 const MAX_FILE_CHARS = 100_000;
